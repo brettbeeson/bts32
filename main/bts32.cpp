@@ -1,5 +1,3 @@
-#include "MemoryReader.h"
-#include "MemorySaver.h"
 #include "Arduino.h"
 #include "BBEsp32Lib.h"
 #include "BME280Sensor.h"
@@ -7,6 +5,8 @@
 #include "BlobSensor.h"
 #include "DSTempSensors.h"
 #include "InfluxPublisher.h"
+#include "MemoryReader.h"
+#include "MemorySaver.h"
 #include "Reading.h"
 #include "VoltageSensor.h"
 #include "WiFiAngel.h"
@@ -31,8 +31,7 @@
 #include "esp_log.h"
 static const char *TAG = "bts32";
 
-#define DEBUG 1
-#define EXCEPTIONS
+#define DEBUG 0
 
 #if DEBUG
 #define SAMPLE_PERIOD_SEC 10
@@ -48,16 +47,12 @@ static const char *TAG = "bts32";
 #define BTS_MAX_CPU_FREQ_MHZ CONFIG_BTS_MAX_CPU_FREQ_MHZ
 #define BTS_MIN_CPU_FREQ_MHZ CONFIG_BTS_MIN_CPU_FREQ_MHZ
 
-
 const int VoltageSensorPin = 39;
 const int TempSensorPin = 25;
 const gpio_num_t LEDPin = GPIO_NUM_2; // GPIO_NUM_2 (D9) is LED BUILTIN
 
-void initialize_sntp();
-void wait_for_ntp();
-void init_power_save();
-
 RTC_DATA_ATTR static int boot_count = 0;
+RTC_DATA_ATTR static time_t last_ntp_sync = 0;
 
 #define TRACE printf("TRACE %s:%d\n", __FILE__, __LINE__);
 
@@ -109,6 +104,7 @@ void readSensors() {
   sensorBlob.begin();
   sensorBlob.readSensors();
   ESP_LOGI(TAG, "Read %d sensors to memory", sensorBlob.readingsInQueue());
+  //ESP_LOGV(TAG, "Sensors: %s", ts.toString().c_str());
   sensorBlob.publish();
   /*
     ESP_LOGV(TAG, "Done publish to Memory: Measurements: %d Samples:%d\n",
@@ -124,40 +120,49 @@ void sleep() {
   fflush(NULL);
   bbesp32lib::Blink.end();
   assert(nsSleep / 1000000.0 < SAMPLE_PERIOD_SEC * 2); // if sleepDuration -ve, would overflow and cause epic sleep time
-  esp_sleep_enable_timer_wakeup(nsSleep);              
+  esp_sleep_enable_timer_wakeup(nsSleep);
   esp_deep_sleep_start();
   assert(0);
 }
 
-void wait_for_ntp() {
-  time_t now = 0;
-  struct tm timeinfo; //= {0};
+/**
+ * Usually, the sntp sub-system will automatically sync every hour.
+ * However, since we deepsleep/reboot, this needs to be done manually. Otherwise every reboot would sync.
+ * When resyncing, it's unclear how to guarantee an update. Can't find API reference.
+*/
+
+void sync_ntp_if_needed() {
+
+  time_t now;
   int retry = 0;
-  const int retry_count = 10;
-
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
-  time(&now);
-  localtime_r(&now, &timeinfo);
-  while (timeinfo.tm_year + 1900 < 2018 && ++retry < retry_count) {
-    ESP_LOGV(TAG, "Waiting for system time to be set... (%d/%d)", retry,
-             retry_count);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    time(&now);
-    localtime_r(&now, &timeinfo);
-  }
-
-  if (timeinfo.tm_year + 1900 < 2018) {
-    ESP_LOGE(TAG, "Unable to set time from NTP");
-    // throw new runtime_error("Unable to set time from NTP");
-  }
-}
-
-void initialize_sntp(void) {
+  const int RETRIES = 10;
+  const int ONE_DAY_S = 3600 * 24;
   const char *ntp = "time.google.com";
+
+  now = time(NULL);
+
+  if (bbesp32lib::timeIsValid() && now - last_ntp_sync < ONE_DAY_S) {
+    ESP_LOGV(TAG, "No SNTP sync required. Last sync was %.2fh ago.", float(now - last_ntp_sync) / 3600);
+    return;
+  }
+
   ESP_LOGI(TAG, "Initializing SNTP");
-  // sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  sntp_setoperatingmode(SNTP_OPMODE_POLL);
   sntp_setservername(0, (char *)ntp);
   sntp_init();
+
+  while (!bbesp32lib::timeIsValid() && ++retry < RETRIES) {
+    ESP_LOGV(TAG, "Waiting for system time to be set... (%d/%d)", retry, RETRIES);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+
+  if (!bbesp32lib::timeIsValid()) {
+    ESP_LOGE(TAG, "Unable to set time from NTP");
+    // throw new runtime_error("Unable to set time from NTP");
+  } else {
+    ESP_LOGI(TAG, "NTP sync'd. Time: %s", bbesp32lib::timestamp().c_str());
+    last_ntp_sync = now;
+  }
 }
 
 void init_power_save() {
@@ -233,11 +238,9 @@ void setupWifi() {
   if (WiFiAngel.begin(60 * 1000)) {
     ESP_LOGI(TAG, "WiFi connected. Setting time...");
     bbesp32lib::Blink.set(5, 50);
-    initialize_sntp();
-    wait_for_ntp();
-    ESP_LOGI(TAG, "Updated to NTP: %s", bbesp32lib::timestamp().c_str());
+
   } else {
-    throw std::runtime_error("Couldn't connect to Wifi. No time available.");
+    throw std::runtime_error("Couldn't connect to Wifi.");
   }
 }
 
@@ -256,18 +259,17 @@ void setup() {
   setvbuf(stdout, NULL, _IONBF, 0);
   esp_log_level_set("*", ESP_LOG_INFO);
   esp_log_level_set(TAG, ESP_LOG_VERBOSE);
-  //esp_log_level_set("InfluxPublisher", ESP_LOG_VERBOSE);
+  esp_log_level_set("DSTempSensor", ESP_LOG_VERBOSE);
+  esp_log_level_set("InfluxPublisher", ESP_LOG_VERBOSE);
   //esp_log_level_set("bbesp32lib", ESP_LOG_INFO);
   //esp_log_level_set("MemorySaver", ESP_LOG_VERBOSE);
-  
   //esp_log_level_set("Publisher", ESP_LOG_VERBOSE);
   esp_log_level_set("wifi", ESP_LOG_WARN);
-  ESP_LOGI(TAG, "boot:%d", boot_count);
+  
 #else
-  esp_log_level_set("*", ESP_LOG_INFO);
-  esp_log_level_set(TAG, ESP_LOG_DEBUG);
-  esp_log_level_set("wifi", ESP_LOG_WARN);
+  esp_log_level_set("*", ESP_LOG_WARN);
 #endif
+
   ESP_ERROR_CHECK(nvs_flash_init());
 
   init_power_save();
@@ -277,52 +279,51 @@ void setup() {
 
   setenv("TZ", "AEST-10", 1);
   tzset();
-  
-  ESP_LOGV(TAG, "Sampling @%ds (x%d). Connecting to %s", SAMPLE_PERIOD_SEC,
-           BULK_SEND, DEFAULT_SSID);
 
-  initSPIFFS();
-  
-  bbesp32lib::LogFile.setFilename("btc32.log");
-  bbesp32lib::LogFile.captureESPLog(true);
+  ESP_LOGV(TAG, "Sampling @%ds (x%d). Connecting to %s", SAMPLE_PERIOD_SEC, BULK_SEND, DEFAULT_SSID);
+
+  //initSPIFFS();
+  // bbesp32lib::LogFile.setFilename("btc32.log");
+  //bbesp32lib::LogFile.captureESPLog(true);
   ESP_LOGI(TAG, "Setup complete");
 }
 
 extern "C" {
 
 void app_main() {
-#ifdef EXCEPTIONS
+
   try {
-#endif
+
     // power_test();
     boot_count++;
-    initArduino(); // required?
+    //initArduino(); // required?
     setup();
 
-    ESP_LOGI(TAG, "Upon wake, time is: %s boot_count:%d", bbesp32lib::timestamp().c_str(),boot_count);
-  
+    ESP_LOGI(TAG, "Upon wake, time is: %s boot_count:%d", bbesp32lib::timestamp().c_str(), boot_count);
+
     if (boot_count == 1) {
-      LogFile.read(true);
-      LogFile.tail(stdout,10,true);
-     setupWifi(); // Get NTP time
       // No reading here: sleep until a time multiple
+      // segfault
+      //LogFile.read(true);
+      //LogFile.tail(stdout,10,true);
+      setupWifi();
+      sync_ntp_if_needed();
     } else if (boot_count == 2 || boot_count % BULK_SEND == 0) {
-    
       readSensors();
       setupWifi();
-          uploadReadings();
+      sync_ntp_if_needed();
+      uploadReadings();
     } else {
       readSensors();
     }
-    
+
     sleep();
-#ifdef EXCEPTIONS
+
   } catch (std::exception &e) {
     ESP_LOGW(TAG, "Run Exception: %s. Restarting in 60s.", e.what());
     bbesp32lib::Blink.set(20, 50);
     vTaskDelay(pdMS_TO_TICKS(60000));
     ESP.restart();
   }
-#endif
 }
 } // extern "C"
