@@ -31,11 +31,11 @@
 #include "esp_log.h"
 static const char *TAG = "bts32";
 
-#define DEBUG 0
 
+#define DEBUG 0
 #if DEBUG
-#define SAMPLE_PERIOD_SEC 10
-#define BULK_SEND 6
+#define SAMPLE_PERIOD_SEC 60
+#define BULK_SEND 10
 #define DEFAULT_SSID "NetComm 0405"
 #define DEFAULT_PWD "wimepuderi"
 #else
@@ -46,6 +46,9 @@ static const char *TAG = "bts32";
 #endif
 #define BTS_MAX_CPU_FREQ_MHZ CONFIG_BTS_MAX_CPU_FREQ_MHZ
 #define BTS_MIN_CPU_FREQ_MHZ CONFIG_BTS_MIN_CPU_FREQ_MHZ
+
+
+
 
 const int VoltageSensorPin = 39;
 const int TempSensorPin = 25;
@@ -90,6 +93,17 @@ void initSPIFFS() {
   }
 }
 
+void countSensors() {
+  // untested
+  DSTempSensors ts(NULL, TempSensorPin);
+  ts.begin();
+
+  bbesp32lib::Blink.flash(ts.nReadings);
+  if (ts.nReadings == 0) {
+    bbesp32lib::Blink.flash(1, BlinkClass::HARE, BlinkClass::LONG);
+  }
+}
+
 void readSensors() {
 
   Blob sensorBlob;
@@ -102,10 +116,18 @@ void readSensors() {
   bbesp32lib::Blink.set(2, 100);
 
   sensorBlob.begin();
-  sensorBlob.readSensors();
-  ESP_LOGI(TAG, "Read %d sensors to memory", sensorBlob.readingsInQueue());
-  //ESP_LOGV(TAG, "Sensors: %s", ts.toString().c_str());
-  sensorBlob.publish();
+
+  try {
+    saveToMemory.taskify();
+    sensorBlob.readSensors(2000);
+    saveToMemory.waitUntilPublished();
+
+  } catch (const std::exception &e) {
+    ESP_LOGE(TAG, "Exception reading sensors: %s", e.what());
+  }
+  if (sensorBlob.readingsInQueue() != 0) {
+    ESP_LOGE(TAG, "There are %d unpublished readings!",sensorBlob.readingsInQueue());
+  }
   /*
     ESP_LOGV(TAG, "Done publish to Memory: Measurements: %d Samples:%d\n",
              saveToMemory.nMeasurements(), saveToMemory.nTotalSamples());
@@ -244,13 +266,29 @@ void setupWifi() {
   }
 }
 
+/**
+ * todo: can throw outside of function
+ * */
 void uploadReadings() {
   Blob uploadBlob;
   InfluxPublisher influx(&uploadBlob, "monitor.phisaver.com", 8086, "test", "bts32", "bbeeson", "imagine");
   MemoryReader reader(&uploadBlob);
-  uploadBlob.begin();
-  uploadBlob.readReaders();
-  uploadBlob.publish();
+  int timeoutS=0;
+
+  try {
+    uploadBlob.begin();
+    influx.taskify();           // publish continuously
+    uploadBlob.readReaders();   // read all. Blocks for 1s on sendToQueue, to allow publishing
+    influx.waitUntilPublished();
+    
+  } catch (const std::exception &e) {
+    ESP_LOGE(TAG, "Exception uploading readers: %s", e.what());
+  }
+  if (uploadBlob.readingsInQueue() > 0) {
+      ESP_LOGE(TAG, "There are un-uploaded readings!");
+    }
+  
+  
 }
 
 void setup() {
@@ -260,12 +298,13 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_INFO);
   esp_log_level_set(TAG, ESP_LOG_VERBOSE);
   esp_log_level_set("DSTempSensor", ESP_LOG_VERBOSE);
-  esp_log_level_set("InfluxPublisher", ESP_LOG_VERBOSE);
+  //esp_log_level_set("InfluxPublisher", ESP_LOG_VERBOSE);
   //esp_log_level_set("bbesp32lib", ESP_LOG_INFO);
   //esp_log_level_set("MemorySaver", ESP_LOG_VERBOSE);
+  //esp_log_level_set("Blob", ESP_LOG_VERBOSE);
   //esp_log_level_set("Publisher", ESP_LOG_VERBOSE);
   esp_log_level_set("wifi", ESP_LOG_WARN);
-  
+
 #else
   esp_log_level_set("*", ESP_LOG_WARN);
 #endif
@@ -302,12 +341,13 @@ void app_main() {
     ESP_LOGI(TAG, "Upon wake, time is: %s boot_count:%d", bbesp32lib::timestamp().c_str(), boot_count);
 
     if (boot_count == 1) {
-      // No reading here: sleep until a time multiple
+
       // segfault
       //LogFile.read(true);
       //LogFile.tail(stdout,10,true);
       setupWifi();
       sync_ntp_if_needed();
+
     } else if (boot_count == 2 || boot_count % BULK_SEND == 0) {
       readSensors();
       setupWifi();
